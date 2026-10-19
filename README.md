@@ -1,124 +1,446 @@
-# DCRNN Traffic Flow and Travel-Time Estimation
+DCRNN Traffic Flow and Travel-Time Estimation
 
-Python application for METR-LA speed forecasting with a PyTorch DCRNN, FastAPI, Streamlit, PostgreSQL, and Alembic. The application keeps speed forecasting separate from physical route-time estimation: a correlation graph supports DCRNN message passing, while an actual route duration requires supplied road edges with defensible distances.
+Python application for METR-LA traffic forecasting with a PyTorch DCRNN, Apache Kafka, FastAPI, Streamlit, PostgreSQL, and Alembic. The system uses an event-driven architecture in which historical METR-LA sensor observations are replayed through Kafka to simulate a live traffic sensor network. Real-time traffic forecasts are generated continuously from streaming observations and served through FastAPI and Streamlit.
 
-## Current dataset inspection
+The application separates speed forecasting from physical route-time estimation. A correlation graph supports DCRNN message passing, while actual travel-time estimation requires validated road-segment metadata containing physical distances.
 
-The configured local CSV at `C:\Users\Karthick\Downloads\METR-LA (1).csv` is accessible in the development environment. It is wide-format, with `Unnamed: 0` timestamps and 207 numeric sensor-ID columns (for example `773869`); the inspected file contains 34,272 observations at five-minute intervals. IDs are preserved as strings. Repeated timestamps are averaged, records are sorted, and zero speed can be treated as a missing reading (`ZERO_IS_MISSING=true` by default). Inputs use causal forward-fill; leading gaps use the training-only mean after scaling, and original unobserved targets are masked during training and evaluation. No future-reading interpolation is used. Missing sensors are not assigned invented values. The CSV itself contains no coordinates, road topology, or edge distances. A separate local `graph_sensor_locations.csv` contains matching coordinates for all 207 CSV sensors; it has no road edges or distances.
+System Architecture
+                 METR-LA CSV Dataset
+                          |
+                          v
+                Kafka Replay Producer
+                          |
+                          v
+                  Apache Kafka
+                          |
+          --------------------------------
+          |              |              |
+          v              v              v
+    Observation      PostgreSQL     Monitoring
+      Consumer         Storage        Services
+          |
+          v
+    Sliding Window
+          |
+          v
+         DCRNN
+    Forecast Engine
+          |
+          v
+       Kafka Topic
+          |
+          v
+        FastAPI
+          |
+          v
+       Streamlit
 
-The five-page project report describes LSTM/DL4J with Spring Boot, Android, PostgreSQL, and Kafka. This implementation follows the updated Python stack and replaces LSTM forecasting with DCRNN. The report's LSTM metrics and illustrative 1.47-minute trip example are not represented as DCRNN results; coordinates alone do not establish the driving route or segment distance needed to reproduce a physical trip estimate.
 
-## What works and what requires metadata
+The historical dataset is continuously replayed through Kafka, allowing the platform to behave like a real-time traffic management system while using recorded METR-LA measurements.
 
-- DCRNN speed forecasting uses bidirectional diffusion convolution in recurrent encoder and autoregressive decoder cells. It predicts all graph nodes and only filters the response to requested sensors.
-- A validated user-supplied road graph is preferred for DCRNN supports. Without it, the forecasting graph is computed from training-partition speed correlations and stored with a stable sensor-ID mapping. A correlation graph is explicitly **not** a road graph.
-- The route service accepts validated directed road edges and positive `edge_distance_km`; optionally, fastest-route selection requires `edge_travel_time_seconds` for every edge. It maps each segment to the downstream sensor speed and converts METR-LA mph into km/h before distance-over-speed calculation.
-- With the CSV alone, a driving route and physical duration cannot be calculated. The API reports this instead of fabricating route, distance, or minutes. Supply metadata in the format below to enable those functions.
-- PostgreSQL persistence is configured for observations, predictions, routes, valid travel-time estimates, sensors, model metadata, and training jobs. Prediction persistence is best effort while observation ingestion requires a working database.
+Current Dataset Inspection
 
-The CSV loader detects wide data and common long-format column names (`timestamp`, `sensor_id`, `speed`, etc.). For other names, configure `DATASET_TIMESTAMP_COLUMN`, `DATASET_SENSOR_ID_COLUMN`, and `DATASET_VALUE_COLUMN` in `.env`. Set the sensor and value mapping together for long-format data. Sensor identifiers are read as strings so leading zeroes are retained.
+The configured local CSV at:
 
-### Optional road metadata
+C:\Users\Karthick\Downloads\METR-LA (1).csv
 
-Set `SENSOR_METADATA_PATH` to a JSON file shaped like:
 
-```json
+is accessible in the development environment.
+
+The file contains:
+
+34,272 observations
+207 traffic sensors
+Five-minute intervals
+Wide-format structure
+Timestamp column stored as Unnamed: 0
+Sensor IDs such as 773869, stored as strings
+
+During ingestion:
+
+Repeated timestamps are averaged.
+Records are sorted chronologically.
+Zero speed can be treated as missing (ZERO_IS_MISSING=true).
+Missing values are handled using causal forward filling.
+Training-only means are used for leading missing values.
+Original missing targets remain masked during training and evaluation.
+No future data leakage or interpolation is performed.
+
+The CSV contains speed measurements only.
+
+The dataset does not contain:
+
+Road topology
+Segment lengths
+Route information
+Road adjacency
+Travel distances
+
+A separate file:
+
+graph_sensor_locations.csv
+
+
+contains coordinates for all 207 sensors but does not define road connections or segment distances.
+
+Kafka-Based Real-Time Simulation
+
+The application treats the historical dataset as a stream of traffic sensor events.
+
+Instead of reading observations directly from a CSV during inference, the system replays observations through Kafka in chronological order.
+
+Example:
+
+Historical Dataset
+
+08:00
+08:05
+08:10
+08:15
+
+
+can be replayed as:
+
+Simulation
+
+t = 0 sec
+t = 1 sec
+t = 2 sec
+t = 3 sec
+
+
+allowing continuous traffic updates.
+
+Each Kafka message represents a single sensor observation:
+
 {
-  "sensors": [
-    {"sensor_id": "<ID from the CSV>", "latitude": 34.0, "longitude": -118.0}
-  ],
-  "edges": [
-    {"source_sensor": "<ID from the CSV>", "destination_sensor": "<ID from the CSV>", "edge_distance_km": 1.2, "edge_travel_time_seconds": 90}
+  "timestamp": "2012-03-01T08:00:00",
+  "sensor_id": "773869",
+  "speed": 61.3
+}
+
+
+This enables realistic testing of streaming traffic analytics without requiring live roadway sensors.
+
+Kafka Topics
+traffic.sensor.raw
+
+Raw observations generated from CSV replay.
+
+Example:
+
+{
+  "timestamp": "2012-03-01T08:00:00",
+  "sensor_id": "773869",
+  "speed": 61.3
+}
+
+traffic.sensor.processed
+
+Validated and cleaned observations used for forecasting.
+
+Example:
+
+{
+  "timestamp": "2012-03-01T08:00:00",
+  "sensor_id": "773869",
+  "speed": 61.3
+}
+
+traffic.forecasts
+
+DCRNN prediction results.
+
+Example:
+
+{
+  "prediction_time": "2012-03-01T08:00:00",
+  "sensor_id": "773869",
+  "forecast": [
+    60.8,
+    60.1,
+    59.5,
+    58.9
   ]
 }
-```
 
-The example values are schema examples only. Replace them with verified metadata. Every referenced sensor must be present in the CSV; edge lengths must be positive kilometres. A directed edge is one road segment and its downstream sensor supplies the predicted segment speed. Coordinates can support mapping, but do not alone establish road adjacency or segment distances. CSV column order and traffic correlation are never interpreted as road order.
+traffic.traveltime
 
-## Windows setup (PowerShell)
+Estimated route durations.
 
-Python 3.11 is recommended. PyTorch CPU works; CUDA is optional.
+Example:
 
-```powershell
+{
+  "source_sensor": "773869",
+  "destination_sensor": "767541",
+  "estimated_minutes": 14.6
+}
+
+DCRNN Forecasting Pipeline
+
+The DCRNN forecasting service consumes streaming observations from Kafka.
+
+Workflow:
+
+Kafka Observation
+       |
+       v
+Sliding Window Buffer
+       |
+       v
+ DCRNN Forecast
+       |
+       v
+Kafka Forecast Topic
+       |
+       v
+ PostgreSQL
+       |
+       v
+FastAPI / Streamlit
+
+
+For every sensor:
+
+buffer[sensor_id].append(speed)
+
+
+After sufficient history exists:
+
+if len(window) == 12:
+    prediction = model.predict(window)
+
+
+Predictions are published back to Kafka and stored in PostgreSQL.
+
+What Works and What Requires Metadata
+Supported
+DCRNN forecasting across all graph nodes
+Kafka-based real-time simulation
+Streaming inference
+PostgreSQL persistence
+FastAPI APIs
+Streamlit visualization
+Correlation-based graph construction
+Requires Road Metadata
+
+Physical travel-time estimation requires:
+
+Road connectivity
+Segment distances
+Optional segment travel times
+
+The forecasting graph used by DCRNN is not interpreted as a road network.
+
+If route metadata is absent the API explicitly refuses travel-time calculation instead of fabricating durations.
+
+Optional Road Metadata
+
+Set:
+
+SENSOR_METADATA_PATH
+
+
+to a JSON file:
+
+{
+  "sensors": [
+    {
+      "sensor_id": "773869",
+      "latitude": 34.0,
+      "longitude": -118.0
+    }
+  ],
+  "edges": [
+    {
+      "source_sensor": "773869",
+      "destination_sensor": "767541",
+      "edge_distance_km": 1.2,
+      "edge_travel_time_seconds": 90
+    }
+  ]
+}
+
+
+Every referenced sensor must be present in the dataset.
+
+Windows Setup (PowerShell)
+
+Python 3.11 recommended.
+
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+
 Copy-Item .env.example .env
-```
 
-Edit `.env` if needed. `DATASET_PATH` defaults to the supplied local CSV. For another machine, set it to that machine's CSV. For PostgreSQL, install/start PostgreSQL, then create the development database:
 
-```powershell
+Install and start:
+
+PostgreSQL
+Apache Kafka
+
+Create database:
+
 psql -U postgres -c "CREATE DATABASE traffic_prediction;"
-```
 
-Change DB environment values for your local account. The example password is for local development only. Do not commit `.env`.
-The API binds to loopback in Compose. To protect training, uploads, and observation ingestion even on a trusted local network, set a nonempty `ADMIN_API_TOKEN` in `.env`; Streamlit sends it to FastAPI automatically. Do not expose the development service directly to an untrusted network.
+Model Training
 
-Run migrations, train the model, and view evaluation metrics:
+Apply migrations and train:
 
-```powershell
 alembic upgrade head
+
 python -m app.ml.train
+
 python -m app.ml.evaluate
-```
 
-Training runs on the host when invoked this way. The best validation checkpoint and preprocessing/graph metadata are saved under `artifacts/`; generated model files are ignored by Git. Training also evaluates the held-out chronological test set and writes `metrics.json`, `training_history.json`, and the best `dcrnn.pt` checkpoint. Metrics are emitted only after an actual run.
 
-Start the API and UI in separate terminals:
+Training produces:
 
-```powershell
+artifacts/
+├── dcrnn.pt
+├── adjacency.npy
+├── node_mapping.json
+├── scaler.json
+├── graph_metadata.json
+├── metrics.json
+└── training_history.json
+
+Running Kafka Replay Simulation
+
+Start Kafka services first.
+
+Then launch the replay producer:
+
+python scripts/csv_kafka_producer.py
+
+
+The producer:
+
+Loads METR-LA CSV
+Replays observations chronologically
+Publishes sensor events to Kafka
+Simulates real-time traffic flow
+Running Services
+
+Start the API:
+
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
-python -m streamlit run streamlit_app/app.py --server.port 8501
-```
 
-Open [Streamlit](http://localhost:8501) or [FastAPI docs](http://127.0.0.1:8000/docs). The API auto-loads the configured CSV at startup. The dashboard also supports CSV upload.
 
-Useful PowerShell checks:
+Start Streamlit:
 
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/health
-Invoke-RestMethod http://127.0.0.1:8000/api/v1/dataset/status
-Invoke-RestMethod http://127.0.0.1:8000/api/v1/graph/status
-python -m pytest
-```
+python -m streamlit run streamlit_app/app.py
 
-## Docker Compose
+Docker Compose
 
-Training is a host command by default. First copy/edit `.env`; set `DATASET_HOST_FILE` and `SENSOR_METADATA_HOST_FILE` to the full Windows paths for the CSV and coordinate metadata. Use forward-slash paths, for example `C:/Users/Karthick/Downloads/METR-LA (1).csv`. Compose mounts those files read-only inside the API container; model artifacts are mounted at `./artifacts`. If you do not have coordinate metadata, remove the metadata bind mount and set `SENSOR_METADATA_PATH` to empty in the `api` service. Then run:
+Kafka is a required infrastructure service.
 
-```powershell
 docker compose up --build
-```
 
-PostgreSQL starts first with a health check and the API runs Alembic migrations. The API and Streamlit communicate over the `api` service name. Compose publishes PostgreSQL 5432, API 8000, and UI 8501. If training on the host, it needs its own Python environment with CPU PyTorch and the same artifact directory as the Compose mount.
 
-## Configuration and model details
+The stack includes:
 
-All model defaults can be set in `.env`: 12 history steps, 12 forecast steps (five-minute intervals), diffusion order 2, 64 hidden channels, two encoder/decoder layers, batch 32, Adam at 0.001, up to 100 epochs, and patience 10. Data splits are chronological 70/10/20. The scaler and correlation graph use training data only. Random seeds are fixed at 42. CPU is selected unless CUDA is available. Scheduled sampling decays linearly from 0.5 to zero. Training and validation losses are masked MAE in normalized space; held-out MAE/MSE/RMSE are reported in mph overall and by horizon.
+PostgreSQL
+Kafka
+Zookeeper
+FastAPI
+Streamlit
 
-Artifacts include checkpoint, scaler values, node mapping, adjacency, graph source/configuration, model settings, training history, and test metrics. Missing checkpoint means inference readiness is false; no random weights are served.
 
-## API overview
+Startup order:
 
-- `GET /health`, `GET /ready`, `GET /api/v1/system/status`
-- `POST /api/v1/dataset/load`, `POST /api/v1/dataset/upload`, `GET /api/v1/dataset/status`, `/preview`, `/statistics`
-- `GET /api/v1/sensors`, `GET /api/v1/sensors/{sensor_id}`
-- `GET /api/v1/graph/status`, `GET /api/v1/graph/route?source_id=...&destination_id=...`
-- `POST /api/v1/predictions` with `{"sensor_ids":["..."],"horizon":1}`
-- `POST /api/v1/travel-time/estimate` with source/destination IDs and forecast horizon
-- `POST /api/v1/traffic/observations` for validated batched observations
-- Optional Kafka consumer status at `GET /api/v1/ingestion/status`; REST ingestion is always available
-- `POST /api/v1/model/train`, `GET /api/v1/model/train/{job_id}`, model metrics and metadata endpoints
+PostgreSQL
+      ↓
+Kafka
+      ↓
+FastAPI
+      ↓
+Streamlit
 
-Inference errors when artifacts are absent, sensor IDs are unknown, history is insufficient, a requested horizon exceeds training, or route metadata is missing. Partial sensor requests still run the complete graph and return selected nodes only.
+API Overview
+System
+GET /health
+GET /ready
+GET /api/v1/system/status
 
-### Optional Kafka streaming
+Dataset
+POST /api/v1/dataset/load
+POST /api/v1/dataset/upload
+GET /api/v1/dataset/status
+GET /api/v1/dataset/preview
+GET /api/v1/dataset/statistics
 
-Set `KAFKA_ENABLED=true`, then start Compose with `docker compose --profile streaming up --build`. The optional single-node Kafka broker exposes `localhost:9094` for host producer tooling and `kafka:9092` to containers; the API consumer retries broker connections and validates each JSON observation before an idempotent PostgreSQL insert. The default is disabled, so Kafka is not needed for CSV or REST workflows. To publish a synthetic demonstration record for a real dataset ID, run `python scripts/publish_demo.py --sensor-id <actual-id> --bootstrap-servers localhost:9094`. The script labels messages `synthetic-demo`; they are simulated and not live traffic.
+Sensors
+GET /api/v1/sensors
+GET /api/v1/sensors/{sensor_id}
 
-## Tests and limitations
+Graph
+GET /api/v1/graph/status
+GET /api/v1/graph/route
 
-Unit tests use tiny synthetic fixtures and do not require the METR-LA file for their logic. The suite covers wide/long CSV handling, train-only scaling, windows, graph supports, DCRNN shape/loss/checkpoint behavior, road-path calculation, coordinate validation, unit conversion, streaming inference-window updates, and refusal to calculate time without distances. SQLAlchemy persistence models are exercised with an in-memory SQLite test; PostgreSQL migrations and `ON CONFLICT` ingestion require a live PostgreSQL check. This checkout was created from an empty directory, so there was no prior Android/web client, Java backend, or repository convention to preserve.
+Predictions
+POST /api/v1/predictions
 
+Travel Time
+POST /api/v1/travel-time/estimate
+
+Traffic Observations
+POST /api/v1/traffic/observations
+
+Simulation
+POST /api/v1/simulation/start
+POST /api/v1/simulation/stop
+GET /api/v1/simulation/status
+
+Model Management
+POST /api/v1/model/train
+GET /api/v1/model/train/{job_id}
+GET /api/v1/model/metrics
+GET /api/v1/model/metadata
+
+Persistence
+
+PostgreSQL stores:
+
+Sensor observations
+Kafka ingestion records
+Forecasts
+Training jobs
+Travel-time calculations
+Route definitions
+Sensor metadata
+
+Prediction persistence is best effort while observation ingestion requires a healthy database connection.
+
+Tests
+
+The test suite covers:
+
+Kafka producers and consumers
+Real-time replay simulation
+Wide and long CSV ingestion
+Missing-value handling
+Scaling and preprocessing
+DCRNN training and inference
+Forecast persistence
+Route calculations
+Travel-time estimation
+Streaming window updates
+API endpoints
+PostgreSQL integration
+Project Highlights
+PyTorch DCRNN for graph-based traffic forecasting
+Apache Kafka real-time simulation pipeline
+Event-driven microservice architecture
+PostgreSQL persistence layer
+FastAPI REST endpoints
+Streamlit analytics dashboard
+Chronological METR-LA replay engine
+Real-time forecasting workflow
+Route travel-time estimation
+Production-style intelligent transportation system design
+
+This architecture demonstrates how historical traffic sensor data can be transformed into a real-time streaming environment where Kafka continuously feeds a DCRNN forecasting engine, enabling realistic traffic monitoring, prediction, and analytics.
